@@ -1,5 +1,7 @@
 import os
 import pandas as pd
+from pandas.errors import SettingWithCopyWarning
+import numpy as np
 import warnings
 import time
 from tqdm import tqdm
@@ -8,6 +10,7 @@ from geopy.extra.rate_limiter import RateLimiter
 import re
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=SettingWithCopyWarning)
 
 def clean_data(df:pd.DataFrame) -> pd.DataFrame:
     # expand the "Tatort 2" column into something more useful
@@ -27,9 +30,7 @@ def clean_data(df:pd.DataFrame) -> pd.DataFrame:
     expanded.drop(columns=["address"], inplace=True)
     # merge the expanded columns back into the original dataframe
     df = df.merge(expanded, left_index=True, right_index=True)
-
     return df
-
 
 def batch_geocode(df:pd.DataFrame) -> pd.DataFrame:
     if not "clean_address" in df.columns:
@@ -49,16 +50,14 @@ def batch_geocode(df:pd.DataFrame) -> pd.DataFrame:
                 return _batch_geocoder(df)
                 
         cache = pd.read_pickle(cache_path)
-        # merge cached results
-        df = df.merge(cache[["clean_address", "lat", "lon"]], on="clean_address", how="left")
-        # geocode the remaining addresses
-        df = df[df["lat"].isna()|df["lon"].isna()]
-        if len(df) == 0:
-            print("All addresses have already been geocoded before. Returning cached results.")
+        # check if the cache contains all addresses, if so, return the cache
+        if cache["clean_address"].isin(df["clean_address"]).all():
             return cache
-        return _batch_geocoder(df)
+        # subset the df to the addresses that are not in the cache
+        to_geocode = df[~df["Aktenzeichen"].isin(cache["Aktenzeichen"])]
+        # geocode the remaining addresses, where the lat and lon are not in the cache
+        return _batch_geocoder(to_geocode) if len(to_geocode) > 0 else cache
     else:
-        print("No cache found. Geocoding all addresses.")
         return _batch_geocoder(df)
 
 def _batch_geocoder(df:pd.DataFrame) -> pd.DataFrame:  
@@ -66,11 +65,13 @@ def _batch_geocoder(df:pd.DataFrame) -> pd.DataFrame:
     unique = df.drop_duplicates(subset="clean_address")
     # remove empty addresses
     unique.dropna(subset=["clean_address"], inplace=True)
-    tqdm.pandas(desc=f"Geocoding {len(unique)} addresses")
+    tqdm.pandas(desc=f"Geocoding {len(unique)} addresses", leave=False)
     geolocator = Nominatim(user_agent="falschparker_aachen")
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
-    unique['results'] = unique.progress_apply(lambda x: geocode(x["clean_address"], language='de'), axis=1)
-    unique[['lat', 'lon']] = unique['results'].apply(lambda x: (x.latitude, x.longitude) if x else None).apply(pd.Series)
+    unique['query'] = unique["clean_address"] + ', Aachen'
+    unique['results'] = unique.progress_apply(lambda x: geocode(x["query"], language='de'), axis=1)
+    #unique['results'] = unique.apply(lambda x: geocode(x["query"], language='de'), axis=1)
+    unique[['lat', 'lon']] = unique['results'].progress_apply(lambda x: (x.latitude, x.longitude) if x else None).apply(pd.Series)
     df = df.merge(unique[["clean_address", "lat", "lon"]], on="clean_address", how="left", suffixes=("_x", ""))
     if "lat_x" in df.columns:
         df.drop(columns=["lat_x"], inplace=True)
@@ -84,6 +85,10 @@ if __name__ == "__main__":
     df = pd.read_csv("data/statistik_test.csv", sep=";")
     df = clean_data(df)
     # testing with a small subset
-    df = batch_geocode(df[:2])
-    print(df.head())
-    df.to_csv("data/statistik_geocoded.csv", index=False)
+    parts = np.array_split(df, 2)
+    print(f"splitting df into {len(parts)} parts")
+    res_df = pd.DataFrame()
+    for part in parts:
+        temp = part.copy()
+        res_df = pd.concat([res_df, batch_geocode(temp)], ignore_index=True).drop_duplicates(subset="Aktenzeichen")
+    res_df.to_csv("data/statistik_geocoded.csv", index=False)
