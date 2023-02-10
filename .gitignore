@@ -133,3 +133,6 @@ ui-tests/playwright-report
 .venv
 plots
 *.zip
+.env
+*.pkl
+*_test
